@@ -508,7 +508,7 @@ def cmd_menu(args):
     while True:
         print()
         print("  ╔══════════════════════════════════════════════════╗")
-        print("  ║      gemini-web2api - pengelola layanan          ║")
+        print("  ║   ✦   geminiwebapi  -  kontrol pusat Gemini  ✦   ║")
         print("  ╚══════════════════════════════════════════════════╝")
         pid = find_pid()
         status = f"PID {pid}" if pid else "mati"

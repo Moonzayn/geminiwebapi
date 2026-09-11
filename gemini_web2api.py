@@ -33,6 +33,8 @@ import hashlib
 import argparse
 import base64
 import binascii
+import threading
+import itertools
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -42,6 +44,8 @@ try:
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
+
+_httpx_client = None
 
 __version__ = "1.1.0"
 
@@ -56,12 +60,13 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-3.8-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "accounts": [],
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -71,6 +76,10 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+"gemini-3.8-flash": {
+        "mode": 1, "think": 1,
+        "desc": "Gemini 3.8 Flash",
+    },
     "gemini-3.7-flash": {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.7 Flash)",
@@ -113,9 +122,35 @@ def log(msg: str):
         sys.stderr.flush()
 
 
-def load_cookie() -> tuple:
+def _parse_cookie_content(content: str) -> tuple:
+    """Parse cookie content string. Returns (cookie_str, sapisid)."""
+    content = content.strip()
+    if content.startswith("["):
+        # JSON array format (e.g. from browser extension)
+        cookies = json.loads(content)
+        pairs = []
+        sapisid = None
+        for c in cookies:
+            name = c.get("name", "")
+            value = c.get("value", "")
+            if name and value:
+                pairs.append(f"{name}={value}")
+                if name == "SAPISID":
+                    sapisid = value
+        return "; ".join(pairs), sapisid
+    elif content.startswith("{"):
+        data = json.loads(content)
+        cookie_str = data.get("cookie", "")
+        sapisid = data.get("sapisid", "")
+        return cookie_str, sapisid if sapisid else None
+    else:
+        pairs = dict(p.split("=", 1) for p in content.split("; ") if "=" in p)
+        return content, pairs.get("SAPISID")
+
+
+def load_cookie(cookie_file: str = None) -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
-    cookie_file = CONFIG.get("cookie_file")
+    cookie_file = cookie_file or CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
     if not os.path.exists(cookie_file):
@@ -123,18 +158,120 @@ def load_cookie() -> tuple:
     try:
         with open(cookie_file, "r") as f:
             content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        return cookie_str, sapisid if sapisid else None
+        return _parse_cookie_content(content)
     except Exception as e:
         log(f"Cookie load error: {e}")
         return "", None
+
+
+def _get_httpx_client():
+    global _httpx_client
+    proxy = CONFIG.get("proxy")
+    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+    if _httpx_client is None:
+        try:
+            import h2  # noqa: F401
+            http2 = True
+        except ImportError:
+            http2 = False
+        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+        kwargs = {
+            "timeout": CONFIG["request_timeout_sec"],
+            "verify": True,
+            "http2": http2,
+            "limits": limits,
+        }
+        if transport:
+            kwargs["transport"] = transport
+        _httpx_client = httpx.Client(**kwargs)
+    return _httpx_client
+
+
+def _close_httpx_client():
+    global _httpx_client
+    if _httpx_client is not None:
+        try:
+            _httpx_client.close()
+        except Exception:
+            pass
+        _httpx_client = None
+
+
+class AccountManager:
+    """Multi-account round-robin rotation manager."""
+    def __init__(self):
+        self._accounts = []
+        self._cycle = None
+        self._lock = threading.Lock()
+        self._current = None
+        self.reload()
+
+    def reload(self):
+        with self._lock:
+            raw = CONFIG.get("accounts", [])
+            self._accounts = []
+            for acc in raw:
+                if isinstance(acc, dict):
+                    cookie_file = acc.get("cookie_file")
+                    auth_user = acc.get("auth_user")
+                    xsrf_token = acc.get("xsrf_token")
+                    name = acc.get("name", cookie_file or "anonymous")
+                    if cookie_file and not os.path.isabs(cookie_file):
+                        cookie_file = os.path.join(
+                            os.path.dirname(os.path.abspath(
+                                __import__("sys").argv[0] if __import__("sys").argv else ".")),
+                            cookie_file,
+                        )
+                    self._accounts.append({
+                        "name": name,
+                        "cookie_file": cookie_file,
+                        "auth_user": auth_user,
+                        "xsrf_token": xsrf_token,
+                    })
+            if self._accounts:
+                self._cycle = itertools.cycle(self._accounts)
+                self._current = self._accounts[0]
+                log(f"AccountManager: loaded {len(self._accounts)} accounts: "
+                    f"{[a['name'] for a in self._accounts]}")
+            else:
+                self._cycle = None
+                log("AccountManager: no accounts configured, using global config")
+
+    def next(self):
+        """Get next account via round-robin. Returns account dict or None."""
+        with self._lock:
+            if not self._cycle:
+                return None
+            self._current = next(self._cycle)
+            return dict(self._current)
+
+    @property
+    def count(self):
+        return len(self._accounts)
+
+
+_account_mgr = AccountManager()
+
+_config_path_for_reload = "config.json"
+_config_mtime_for_reload = [0.0]
+
+
+def set_reload_config_path(path: str):
+    global _config_path_for_reload
+    _config_path_for_reload = path or "config.json"
+
+
+def reload_accounts_if_changed():
+    """Reload config/accounts when config.json changes (hot add/remove akun)."""
+    try:
+        mtime = os.path.getmtime(_config_path_for_reload)
+        if mtime != _config_mtime_for_reload[0]:
+            _config_mtime_for_reload[0] = mtime
+            with open(_config_path_for_reload) as f:
+                CONFIG.update(json.load(f))
+            _account_mgr.reload()
+    except Exception:
+        pass
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -143,8 +280,10 @@ def make_sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {ts}_{h}"
 
 
-def account_prefix() -> str:
+def account_prefix(account: dict = None) -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
+    if account and account.get("auth_user") is not None and account.get("auth_user") != "":
+        return f"/u/{account['auth_user']}"
     auth_user = CONFIG.get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
@@ -220,7 +359,7 @@ def upload_images(images: list) -> list:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, account: dict = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
@@ -247,11 +386,12 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
 
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    xsrf = (account.get("xsrf_token") if account else None) or CONFIG.get("xsrf_token")
+    if xsrf:
+        params["at"] = xsrf
     body = urllib.parse.urlencode(params).encode()
     reqid = int(time.time()) % 1000000
-    prefix = account_prefix()
+    prefix = account_prefix(account)
     url = (
         f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
@@ -264,10 +404,16 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
-    if prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+    if account:
+        if account.get("auth_user") is not None and account.get("auth_user") != "":
+            headers["X-Goog-AuthUser"] = str(account["auth_user"])
+        cookie_file = account.get("cookie_file")
+    else:
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        cookie_file = CONFIG.get("cookie_file")
 
-    cookie_str, sapisid = load_cookie()
+    cookie_str, sapisid = load_cookie(cookie_file)
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -276,6 +422,11 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
+            if HAS_HTTPX:
+                client = _get_httpx_client()
+                resp = client.post(url, content=body, headers=headers)
+                resp.raise_for_status()
+                return resp.text
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             ctx = ssl.create_default_context()
             proxy = CONFIG.get("proxy")
@@ -311,7 +462,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None, account: dict = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
     if file_refs:
@@ -338,11 +489,12 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    xsrf = (account.get("xsrf_token") if account else None) or CONFIG.get("xsrf_token")
+    if xsrf:
+        params["at"] = xsrf
     body = urllib.parse.urlencode(params)
     reqid = int(time.time()) % 1000000
-    prefix = account_prefix()
+    prefix = account_prefix(account)
     url = (
         f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
@@ -355,9 +507,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
-    if prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
+    if account:
+        if account.get("auth_user") is not None and account.get("auth_user") != "":
+            headers["X-Goog-AuthUser"] = str(account["auth_user"])
+        cookie_file = account.get("cookie_file")
+    else:
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        cookie_file = CONFIG.get("cookie_file")
+    cookie_str, sapisid = load_cookie(cookie_file)
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -367,15 +525,15 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, account)
         text = extract_response_text(raw)
         if text:
             yield text
         return
 
     prev_text = ""
-    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+    client = _get_httpx_client()
+    try:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -413,12 +571,14 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
                 if update_bl_if_needed():
                     log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, account)
                     text = extract_response_text(raw)
                     if text:
                         yield text
                     return
             raise
+    finally:
+        _close_httpx_client()
 
 
 def clean_gemini_text(text: str, strip: bool = True) -> str:
@@ -680,6 +840,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            reload_accounts_if_changed()
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -703,6 +864,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            reload_accounts_if_changed()
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -762,8 +924,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None):
-        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, account=None):
+        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, account)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -786,6 +948,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        account = _account_mgr.next()
+        if account:
+            log(f"Using account: {account.get('name')}")
         try:
             file_refs = upload_images(images)
         except RuntimeError as e:
@@ -803,7 +968,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                                "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs):
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, file_refs, account):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -822,7 +987,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, account)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -909,9 +1074,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        account = _account_mgr.next()
+        if account:
+            log(f"Using account: {account.get('name')}")
         try:
             file_refs = upload_images(images)
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, file_refs, account)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1009,9 +1177,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
+        account = _account_mgr.next()
+        if account:
+            log(f"Using account: {account.get('name')}")
         try:
             file_refs = upload_images(images)
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs)
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None, file_refs, account)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1069,6 +1240,8 @@ def main():
                 config_path = p
                 break
     load_config(config_path)
+    set_reload_config_path(config_path)
+    _account_mgr.reload()
 
     if args.port:
         CONFIG["port"] = args.port
@@ -1091,7 +1264,11 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    if _account_mgr.count:
+        accounts = [a["name"] for a in _account_mgr._accounts]
+        print(f"  Accounts:  {_account_mgr.count}x round-robin: {', '.join(accounts)}")
+    else:
+        print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")

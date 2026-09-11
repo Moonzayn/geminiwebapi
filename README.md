@@ -18,6 +18,8 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Web Search**: Built-in internet access (Gemini's native search)
 - **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
 - **Streaming**: SSE streaming support via `httpx`
+- **Multi-Account**: Round-robin rotation across multiple Google accounts (backup / quota sharing), with hot reload
+- **gemini-manager CLI**: One command to add/remove accounts and manage the service
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
@@ -29,6 +31,28 @@ python gemini_web2api.py
 ```
 
 Server starts at `http://localhost:8081/v1`.
+
+## One-Command Setup (install.sh)
+
+On a fresh machine, clone the repo and run the installer. It sets up the
+virtualenv, installs dependencies, creates `config.json`, and installs the
+global `gemini-manager` CLI:
+
+```bash
+git clone https://github.com/Sophomoresty/gemini-web2api.git
+cd gemini-web2api
+./install.sh
+```
+
+Next, export cookies on *this* machine (cookies are device-bound), add your
+accounts, and start:
+
+```bash
+gemini-manager add-account akun-1 --cookie-file cookie.txt
+gemini-manager add-account akun-2 --cookie-file cookie2.txt
+gemini-manager start
+gemini-manager test --count 4
+```
 
 ## Client Configuration
 
@@ -157,6 +181,82 @@ If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini W
 
 Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
 
+## Multi-Account Rotation (Backup Accounts)
+
+Register multiple Google accounts and the server rotates between them
+**round-robin on every request** — ideal when you have 2+ free or Pro accounts
+and want to share quota load or have a backup when one account hits a rate
+limit. No need to run multiple instances.
+
+### Configuration
+
+Add an `accounts` array to `config.json`. Each entry can contain:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Optional label, shown in logs and `list-accounts` |
+| `cookie_file` | Path to that account's cookie file |
+| `auth_user` | Google account index. Blank = default account, `1` = second, etc. |
+| `xsrf_token` | Per-account XSRF token (optional) |
+
+```json
+{
+  "cookie_file": "/path/to/cookie.txt",
+  "accounts": [
+    {"name": "akun-1", "cookie_file": "/path/to/cookie.txt", "auth_user": null},
+    {"name": "akun-2", "cookie_file": "/path/to/cookie2.txt", "auth_user": 1}
+  ]
+}
+```
+
+When `accounts` is non-empty it takes precedence over the top-level
+`cookie_file`. If `accounts` is empty, the single-account top-level settings
+are used.
+
+### Cookie formats
+
+Cookie files may be any of:
+
+- A raw cookie string:
+  `SID=xxx; HSID=xxx; ...; SAPISID=xxx; __Secure-1PSID=xxx`
+- JSON: `{"cookie": "SID=xxx; ...", "sapisid": "xxx"}`
+- A browser-extension JSON array export (all cookies are joined automatically):
+
+```json
+[
+  {"domain": ".google.com", "name": "SAPISID",  "value": "www-xxx"},
+  {"domain": ".google.com", "name": "SID",      "value": "g.a000..."},
+  {"domain": ".google.com", "name": "__Secure-1PSID", "value": "g.a000..."}
+]
+```
+
+### Hot reload
+
+Adding or removing accounts takes effect immediately — **no restart needed**.
+The server watches `config.json` on every request and reloads the account list
+when the file changes.
+
+## gemini-manager
+
+A convenience CLI bundled with the repo to manage the service and accounts:
+
+```bash
+gemini-manager status                 # service + account overview
+gemini-manager list-accounts          # list accounts + cookie expiry
+gemini-manager add-account akun-2 --cookie-file cookie2.txt --auth-user 1
+gemini-manager add-account akun-2 --cookie-json '[{...}]'
+gemini-manager remove-account akun-2 --delete-cookie
+gemini-manager start | stop | restart
+gemini-manager test --count 4         # send test requests, verify rotation
+gemini-manager install-service --enable --start   # systemd unit (needs sudo)
+gemini-manager uninstall-service
+```
+
+`install.sh` links it into `~/.local/bin`, so `gemini-manager` works from any
+directory after you log out/in (or `source ~/.bashrc`). `install-service`
+generates the systemd unit with the correct project path, user, and venv
+python for the machine it runs on.
+
 ## Configuration
 
 Create `config.json` in the same directory:
@@ -173,11 +273,15 @@ Create `config.json` in the same directory:
   "xsrf_token": null,
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
+  "accounts": [],
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false
 }
 ```
+
+For multiple accounts, fill the `accounts` array as described in
+[Multi-Account Rotation](#multi-account-rotation-backup-accounts).
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.

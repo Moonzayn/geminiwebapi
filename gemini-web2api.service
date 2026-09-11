@@ -1,0 +1,16 @@
+[Unit]
+Description=Gemini Web2API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/z/gemini-web2api
+ExecStart=/home/z/gemini-web2api/venv/bin/python /home/z/gemini-web2api/gemini_web2api.py --config /home/z/gemini-web2api/config.json
+Restart=always
+RestartSec=3
+User=z
+Group=z
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -3,7 +3,15 @@ __pycache__/
 config.json
 cookie.txt
 cookie.json
+cookie*.txt
 .env
 .idea
 .DS_Store
 gemini-auth.json
+
+venv/
+*.bak
+*.backup
+*.log
+*.pid
+nohup.out

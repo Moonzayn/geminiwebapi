@@ -333,6 +333,97 @@ def update_bl_if_needed() -> bool:
     return False
 
 
+_XSRF_CACHE: dict = {}
+
+
+def _account_key(account: dict = None) -> str:
+    if account and account.get("name"):
+        return account["name"]
+    if account and account.get("cookie_file"):
+        return account["cookie_file"]
+    return "default"
+
+
+def _status_of(e) -> int:
+    return (getattr(getattr(e, "response", None), "status_code", None)
+            or getattr(e, "code", None) or 0)
+
+
+def _safe_error_text(e) -> str:
+    try:
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                return resp.read().decode("utf-8", "replace")
+            except Exception:
+                return getattr(resp, "text", "") or ""
+        if hasattr(e, "read"):
+            return e.read().decode("utf-8", "replace")
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_xsrf_from_error(text: str) -> str:
+    m = re.search(r'"xsrf","([^",]+)"', text or "")
+    return m.group(1) if m else ""
+
+
+def _fetch_snlm0e(account: dict = None) -> str:
+    """Fetch the SNlM0e (anti-XSRF) token from the Gemini page HTML."""
+    prefix = account_prefix(account)
+    url = f"https://gemini.google.com{prefix}/app"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"https://gemini.google.com{prefix}/app",
+        "X-Same-Domain": "1",
+    }
+    cookie_file = None
+    if account:
+        if account.get("auth_user") is not None and account.get("auth_user") != "":
+            headers["X-Goog-AuthUser"] = str(account["auth_user"])
+        cookie_file = account.get("cookie_file")
+    else:
+        if prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        cookie_file = CONFIG.get("cookie_file")
+    cookie_str, sapisid = load_cookie(cookie_file)
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    try:
+        client = _get_httpx_client()
+        r = client.get(url, headers=headers, timeout=CONFIG["request_timeout_sec"])
+        r.raise_for_status()
+        m = re.search(r'"SNlM0e":"([^"]+)"', r.text)
+        if m:
+            token = m.group(1)
+            _XSRF_CACHE[_account_key(account)] = token
+            return token
+    except Exception as e:
+        log(f"xnlm0e fetch failed: {e}")
+    return ""
+
+
+def _resolve_xsrf(account: dict = None, err_text: str = "") -> str:
+    token = _extract_xsrf_from_error(err_text)
+    if not token:
+        token = _fetch_snlm0e(account)
+    if token:
+        _XSRF_CACHE[_account_key(account)] = token
+    return token
+
+
+def _get_xsrf(account: dict = None) -> str:
+    key = _account_key(account)
+    if account and account.get("xsrf_token"):
+        return account["xsrf_token"]
+    if key in _XSRF_CACHE:
+        return _XSRF_CACHE[key]
+    if CONFIG.get("xsrf_token"):
+        return CONFIG["xsrf_token"]
+    return _fetch_snlm0e(account)
+
+
 def upload_images(images: list) -> list:
     """Upload parsed OpenAI image parts and return Gemini file references."""
     if not images:
@@ -386,7 +477,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
 
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    xsrf = (account.get("xsrf_token") if account else None) or CONFIG.get("xsrf_token")
+    xsrf = _get_xsrf(account)
     if xsrf:
         params["at"] = xsrf
     body = urllib.parse.urlencode(params).encode()
@@ -450,11 +541,27 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 log("Retrying with updated BL...")
                 last_err = e
                 continue
+            if e.code in (400, 403):
+                err_text = _safe_error_text(e)
+                nx = _resolve_xsrf(account, err_text)
+                if nx:
+                    params["at"] = nx
+                    body = urllib.parse.urlencode(params).encode()
+                    log(f"XSRF required, retrying with token for {_account_key(account)}")
+                    continue
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            if _status_of(e) in (400, 403):
+                err_text = _safe_error_text(e)
+                nx = _resolve_xsrf(account, err_text)
+                if nx:
+                    params["at"] = nx
+                    body = urllib.parse.urlencode(params).encode()
+                    log(f"XSRF required, retrying with token for {_account_key(account)}")
+                    continue
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -489,7 +596,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    xsrf = (account.get("xsrf_token") if account else None) or CONFIG.get("xsrf_token")
+    xsrf = _get_xsrf(account)
     if xsrf:
         params["at"] = xsrf
     body = urllib.parse.urlencode(params)
@@ -534,49 +641,59 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     prev_text = ""
     client = _get_httpx_client()
     try:
-        try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                resp.raise_for_status()
-                buf = ""
-                for chunk in resp.iter_text():
-                    buf += chunk
-                    if "BardErrorInfo" in buf:
-                        import re as _re
-                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if m:
-                            raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        if '"wrb.fr"' not in line or len(line) < 200:
-                            continue
-                        try:
-                            arr = json.loads(line)
-                            inner_str = arr[0][2]
-                            if not inner_str or len(inner_str) < 50:
+        for attempt in range(2):
+            try:
+                with client.stream("POST", url, content=body, headers=headers) as resp:
+                    resp.raise_for_status()
+                    buf = ""
+                    for chunk in resp.iter_text():
+                        buf += chunk
+                        if "BardErrorInfo" in buf:
+                            import re as _re
+                            m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                            if m:
+                                raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            if '"wrb.fr"' not in line or len(line) < 200:
                                 continue
-                            inner2 = json.loads(inner_str)
-                            if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                                for part in inner2[4]:
-                                    if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                        for t in part[1]:
-                                            if isinstance(t, str) and len(t) > len(prev_text):
-                                                delta = t[len(prev_text):]
-                                                delta = clean_gemini_text(delta, strip=False)
-                                                if delta:
-                                                    yield delta
-                                                prev_text = t
-                        except (json.JSONDecodeError, IndexError, TypeError):
-                            pass
-        except Exception as e:
-            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
-                if update_bl_if_needed():
-                    log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, account)
-                    text = extract_response_text(raw)
-                    if text:
-                        yield text
-                    return
-            raise
+                            try:
+                                arr = json.loads(line)
+                                inner_str = arr[0][2]
+                                if not inner_str or len(inner_str) < 50:
+                                    continue
+                                inner2 = json.loads(inner_str)
+                                if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
+                                    for part in inner2[4]:
+                                        if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+                                            for t in part[1]:
+                                                if isinstance(t, str) and len(t) > len(prev_text):
+                                                    delta = t[len(prev_text):]
+                                                    delta = clean_gemini_text(delta, strip=False)
+                                                    if delta:
+                                                        yield delta
+                                                    prev_text = t
+                            except (json.JSONDecodeError, IndexError, TypeError):
+                                pass
+                break
+            except Exception as e:
+                if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
+                    if update_bl_if_needed():
+                        log("BL updated, falling back to non-streaming for this request")
+                        raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, account)
+                        text = extract_response_text(raw)
+                        if text:
+                            yield text
+                        return
+                if attempt == 0 and _status_of(e) in (400, 403):
+                    err_text = _safe_error_text(e)
+                    nx = _resolve_xsrf(account, err_text)
+                    if nx:
+                        params["at"] = nx
+                        body = urllib.parse.urlencode(params)
+                        log(f"XSRF required, retrying stream with token for {_account_key(account)}")
+                        continue
+                raise
     finally:
         _close_httpx_client()
 

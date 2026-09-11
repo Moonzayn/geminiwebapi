@@ -807,6 +807,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        acc = getattr(self, "_current_account", None)
+        if acc:
+            self.send_header("X-Gemini-Account", acc.get("name", ""))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -949,6 +952,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         account = _account_mgr.next()
+        self._current_account = account
         if account:
             log(f"Using account: {account.get('name')}")
         try:
@@ -962,6 +966,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                self.send_header("X-Gemini-Account", (getattr(self, "_current_account", None) or {}).get("name", ""))
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -1001,6 +1006,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             # Stream mode with tools: send as single chunk (need full parse for tool_calls)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("X-Gemini-Account", (getattr(self, "_current_account", None) or {}).get("name", ""))
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -1075,6 +1081,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         account = _account_mgr.next()
+        self._current_account = account
         if account:
             log(f"Using account: {account.get('name')}")
         try:
@@ -1098,6 +1105,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("X-Gemini-Account", (getattr(self, "_current_account", None) or {}).get("name", ""))
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -1178,6 +1186,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         account = _account_mgr.next()
+        self._current_account = account
         if account:
             log(f"Using account: {account.get('name')}")
         try:
@@ -1206,6 +1215,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("X-Gemini-Account", (getattr(self, "_current_account", None) or {}).get("name", ""))
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()

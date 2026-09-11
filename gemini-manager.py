@@ -316,9 +316,10 @@ def cmd_test(args):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
+                acc = resp.headers.get("X-Gemini-Account", "?")
             text = data["choices"][0]["message"]["content"]
             ok += 1
-            print(f"  [{i+1}/{n}] OK -> {text[:40]!r}")
+            print(f"  [{i+1}/{n}] {acc} -> {text[:40]!r}")
         except Exception as e:
             print(f"  [{i+1}/{n}] ERROR: {e}")
     print(f"  Sukses {ok}/{n}")

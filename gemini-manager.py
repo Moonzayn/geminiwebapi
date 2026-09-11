@@ -17,6 +17,7 @@ Contoh:
   gemini-manager test 4
 """
 import argparse
+from argparse import Namespace
 import getpass
 import json
 import os
@@ -367,13 +368,198 @@ def cmd_uninstall_service(args):
     print("  Service systemd dihapus.")
 
 
+# ─── Interactive menu & monitor ───────────────────────────────────────────────
+
+def _input(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(0)
+
+
+def read_cookie_paste(prompt):
+    """Read multi-line pasted cookie until an empty line."""
+    print(f"  {prompt}")
+    print("  (paste lalu tekan Enter 2x / baris kosong untuk selesai)")
+    print("  =====================================================================")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line.strip():
+            break
+        lines.append(line)
+    print("  =====================================================================")
+    content = "\n".join(lines).strip()
+    if not content:
+        print("  ERROR: kosong, tidak jadi apa-apa.")
+        return None
+    stripped = content.lstrip()
+    if stripped.startswith(("[", "{")):
+        try:
+            json.loads(content)
+        except json.JSONDecodeError:
+            print("  ERROR: JSON tidak valid, gagal menyimpan.")
+            return None
+    return content
+
+
+def _add_account_interactive(args):
+    name = _input("  Nama akun (mis. akun-1): ")
+    if not name:
+        return
+    flex = input("  Auth user index Enter=default, 1=akun2, 2=akun3: ").strip()
+    auth_user = int(flex) if flex else None
+    source = _input("  Cookie dari (1) paste manual / (2) file: ")
+    if source == "2":
+        path = _input("  Path file cookie: ")
+        if not path:
+            return
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            alt = os.path.join(BASE, path)
+            if os.path.exists(alt):
+                path = alt
+        if not os.path.exists(path):
+            print(f"  ERROR: file tidak ada: {path}")
+            return
+        with open(path) as f:
+            content = f.read().strip()
+        if not content:
+            print("  ERROR: file kosong.")
+            return
+    else:
+        content = read_cookie_paste("TEMPEL cookie akun di sini")
+        if content is None:
+            return
+    args.cookie_json = content
+    args.cookie_file = None
+    args.name = name
+    args.auth_user = auth_user
+    args.xsrf_token = None
+    cmd_add(args)
+
+
+def _remove_account_interactive(args):
+    cfg = load_config()
+    accounts = cfg.get("accounts", [])
+    if not accounts:
+        print("  Belum ada akun.")
+        return
+    cmd_list(args)
+    name = _input("  Nama akun yang dihapus (atau kosong untuk batal): ")
+    if not name:
+        return
+    do_del = _input("  Hapus juga file cookie-nya? (y/N): ").lower()
+    args.name = name
+    args.delete_cookie = do_del == "y"
+    cmd_remove(args)
+
+
+def cmd_monitor(args):
+    """Live monitor: request log + akun yg dipakai tiap request."""
+    try:
+        print(f"  Monitor log: {LOG_FILE}  (Ctrl+C untuk keluar)")
+        print("  ───────────────────────────────────────────────")
+        counts = {}
+        pos = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
+        while True:
+            time.sleep(args.interval)
+            if not os.path.exists(LOG_FILE):
+                continue
+            size = os.path.getsize(LOG_FILE)
+            if size > pos:
+                with open(LOG_FILE) as f:
+                    f.seek(pos)
+                    for line in f:
+                        m = re.search(r"Using account: (\S+)", line)
+                        if m:
+                            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+                        s = line.rstrip("\n")
+                        if s:
+                            print(f"  {s}", flush=True)
+                    pos = f.tell()
+                if counts:
+                    usage = "  ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                    print(f"\n  [sedang aktif -> {usage}]\n", flush=True)
+            if size < pos:  # log di-truncate/rotate
+                pos = 0
+    except KeyboardInterrupt:
+        print("\n  Monitor berhenti.")
+
+
+def cmd_menu(args):
+    menu_items = [
+        ("Status service & akun", cmd_status),
+        ("Lihat daftar akun", cmd_list),
+        ("Tambah akun (paste cookie)", _add_account_interactive),
+        ("Hapus akun", _remove_account_interactive),
+        ("Start service", cmd_start),
+        ("Stop service", cmd_stop),
+        ("Restart service", cmd_restart),
+        ("Monitor request real-time", cmd_monitor),
+        ("Test rotasi akun", cmd_test),
+        ("Install/uninstall systemd service", cmd_service_menu),
+        ("Keluar", None),
+    ]
+    while True:
+        print()
+        print("  ╔══════════════════════════════════════════════════╗")
+        print("  ║      gemini-web2api - pengelola layanan          ║")
+        print("  ╚══════════════════════════════════════════════════╝")
+        pid = find_pid()
+        status = f"PID {pid}" if pid else "mati"
+        acc = _account_mgr_count()
+        print(f"  [{'●' if pid else '○'} service {status}] [akun: {acc}]")
+        print()
+        for i, (label, _) in enumerate(menu_items, 1):
+            print(f"  {i}. {label}")
+        choice = _input(f"\n  Pilih (1-{len(menu_items)}): ")
+        try:
+            idx = int(choice)
+        except ValueError:
+            continue
+        if idx < 1 or idx > len(menu_items):
+            continue
+        label, fn = menu_items[idx - 1]
+        if fn is None:
+            print("  Dadah!")
+            return
+        fn(Namespace(
+            no_log=False, count=3, api_key=None, delete_cookie=False,
+            interval=0.5, verbose=False, xsrf_token=None, cookie_file=None,
+            cookie_json=None, name=None, auth_user=None, enable=False, start=False,
+        ))
+
+
+def cmd_service_menu(args):
+    print()
+    print("  1. Install systemd service (--enable --start)")
+    print("  2. Uninstall systemd service")
+    c = _input("  Pilih (1/2, kosong batal): ")
+    if c == "1":
+        cmd_install_service(Namespace(enable=True, start=True))
+    elif c == "2":
+        cmd_uninstall_service(Namespace())
+    else:
+        print("  Batal.")
+
+
+def _account_mgr_count():
+    cfg = load_config()
+    return len(cfg.get("accounts", []))
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     global CONFIG_MODEL
     parser = argparse.ArgumentParser(prog="gemini-manager", description=__doc__)
     parser.add_argument("--verbose", action="store_true", help="tampilkan detail")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd")
 
     p = sub.add_parser("status", help="status service & akun")
     p.set_defaults(fn=cmd_status)
@@ -417,14 +603,22 @@ def main():
     p = sub.add_parser("uninstall-service", help="hapus unit systemd")
     p.set_defaults(fn=cmd_uninstall_service)
 
+    p = sub.add_parser("menu", help="menu interaktif")
+    p.set_defaults(fn=cmd_menu)
+
+    p = sub.add_parser("monitor", help="monitor request real-time")
+    p.add_argument("--interval", type=float, default=0.5, help="interval cek log (detik)")
+    p.set_defaults(fn=cmd_monitor)
+
     args = parser.parse_args()
     global CONFIG_MODEL, PORT
     cfg = load_config()
     CONFIG_MODEL = cfg.get("default_model", "gemini-3.6-flash")
     if cfg.get("port"):
         PORT = cfg["port"]
-    args_fn = args
-    args.fn(args_fn)
+    if args.cmd is None:
+        args.fn = cmd_menu
+    args.fn(args)
 
 
 if __name__ == "__main__":

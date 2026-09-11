@@ -238,16 +238,23 @@ when the file changes.
 
 ## gemini-manager
 
-A convenience CLI bundled with the repo to manage the service and accounts:
+A convenience CLI bundled with the repo to manage the service and accounts.
+Run `gemini-manager` with no arguments (or `gemini-manager menu`) for the
+interactive menu — add accounts by pasting cookies, remove accounts, start/stop
+the service, or monitor requests live. The CLI subcommands are also available
+directly:
 
 ```bash
-gemini-manager status                 # service + account overview
-gemini-manager list-accounts          # list accounts + cookie expiry
+gemini-manager                    # interactive menu
+
+gemini-manager status             # service + account overview
+gemini-manager list-accounts      # list accounts + cookie expiry
 gemini-manager add-account akun-2 --cookie-file cookie2.txt --auth-user 1
 gemini-manager add-account akun-2 --cookie-json '[{...}]'
 gemini-manager remove-account akun-2 --delete-cookie
 gemini-manager start | stop | restart
-gemini-manager test --count 4         # send test requests, verify rotation
+gemini-manager monitor            # live request log + per-account usage
+gemini-manager test --count 4     # send test requests, verify rotation
 gemini-manager install-service --enable --start   # systemd unit (needs sudo)
 gemini-manager uninstall-service
 ```

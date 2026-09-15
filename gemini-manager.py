@@ -7,6 +7,7 @@ Mengelola:
   - tambah / hapus / lihat akun Google (dengan rotasi round-robin)
   - test rotasi akun
   - install / uninstall systemd service
+  - tambah / hapus / login / chat akun Antigravity (round-robin antar akun)
 
 Contoh:
   gemini-manager status
@@ -15,6 +16,9 @@ Contoh:
   gemini-manager remove-account akun-2
   gemini-manager start | stop | restart
   gemini-manager test 4
+  gemini-manager antigravity add agy-b
+  gemini-manager antigravity login agy-b
+  gemini-manager antigravity chat "halo"
 """
 import argparse
 from argparse import Namespace
@@ -37,6 +41,62 @@ SERVICE_UNIT = os.path.join(BASE, "gemini-web2api.service")
 VENV_PY = os.path.join(BASE, "venv", "bin", "python3")
 
 PORT = 8081
+
+# ─── antigravity (round-robin akun) ───────────────────────────────────────────
+
+ANTI_DIR = os.path.join(os.path.expanduser("~"), ".antigravity-accounts")
+ANTI_CONFIG = os.path.join(ANTI_DIR, "config.json")
+ANTI_BIN_CANDIDATES = ("/home/z/.local/bin/agy", os.path.expanduser("~/.local/bin/agy"))
+
+
+def agy_bin():
+    import shutil
+    for cand in ANTI_BIN_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return shutil.which("agy") or "agy"
+
+
+def anti_load():
+    cfg = {"accounts": [], "index": 0}
+    if os.path.exists(ANTI_CONFIG):
+        try:
+            with open(ANTI_CONFIG) as f:
+                cfg.update(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            pass
+    cfg.setdefault("accounts", [])
+    cfg.setdefault("index", 0)
+    return cfg
+
+
+def anti_save(cfg):
+    os.makedirs(ANTI_DIR, exist_ok=True)
+    tmp = ANTI_CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, ANTI_CONFIG)
+
+
+def anti_home(acc):
+    return acc.get("home", os.path.expanduser("~"))
+
+
+def anti_token(acc):
+    return os.path.join(anti_home(acc), ".gemini", "antigravity-cli",
+                        "antigravity-oauth-token")
+
+
+def anti_pick(cfg):
+    accs = cfg["accounts"]
+    if not accs:
+        return None
+    idx = cfg.get("index", 0) or 0
+    acc = accs[idx % len(accs)]
+    cfg["index"] = (idx + 1) % len(accs)
+    anti_save(cfg)
+    return acc
 
 
 # ─── config helpers ───────────────────────────────────────────────────────────
@@ -188,6 +248,20 @@ def cmd_status(args):
         print("  Health:     DOWN (port tidak open)")
 
 
+def cmd_list_keys(args):
+    cfg = load_config()
+    keys = cfg.get("api_keys", [])
+    if not keys:
+        print("  Belum ada API key terdaftar.")
+        return
+    print(f"{'#':<3} {'api_key':<70} {'status'}")
+    for i, key in enumerate(keys, 1):
+        print(f"{i:<3} {key:<70} aktif")
+    if args.verbose:
+        print()
+        print("  Path config: " + CONFIG_FILE)
+
+
 def cmd_list(args):
     cfg = load_config()
     accounts = cfg.get("accounts", [])
@@ -324,6 +398,186 @@ def cmd_test(args):
             print(f"  [{i+1}/{n}] ERROR: {e}")
     print(f"  Sukses {ok}/{n}")
 
+
+def _anti_find(cfg, name):
+    for a in cfg["accounts"]:
+        if a.get("name") == name:
+            return a
+    return None
+
+
+def cmd_anti_list(args):
+    cfg = anti_load()
+    accs = cfg["accounts"]
+    print(f"Antigravity round-robin ({len(accs)} akun, urutan berikutnya: "
+          f"index {cfg.get('index', 0)} di {anti_bin_desc()})")
+    if not accs:
+        print("  Belum ada akun. Tambah: gemini-manager antigravity add NAMA")
+        return
+    for i, acc in enumerate(accs):
+        name = acc.get("name", "?")
+        token = os.path.exists(anti_token(acc))
+        home = anti_home(acc)
+        next_ = "=>" if i == cfg.get("index", 0) % len(accs) else "  "
+        print(f"  {next_} {name:<16} token {'ADA' if token else 'BELUM'}  {home}")
+    if args.verbose:
+        print("  Config: " + ANTI_CONFIG)
+
+
+def cmd_anti_add(args):
+    cfg = anti_load()
+    if _anti_find(cfg, args.name):
+        print(f"ERROR: akun '{args.name}' sudah ada.")
+        sys.exit(1)
+    if args.home:
+        home = os.path.realpath(os.path.expanduser(args.home))
+        if not os.path.isdir(home):
+            print(f"ERROR: folder HOME tidak ada: {home}")
+            sys.exit(1)
+    else:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "-", args.name)
+        home = os.path.join(ANTI_DIR, safe)
+        os.makedirs(os.path.join(home, ".gemini", "antigravity-cli"), exist_ok=True)
+    cfg["accounts"].append({"name": args.name, "home": home})
+    anti_save(cfg)
+    print(f"  Akun '{args.name}' didaftarkan (HOME: {home}).")
+    print("  Login sekali: gemini-manager antigravity login " + args.name)
+
+
+def cmd_anti_remove(args):
+    cfg = anti_load()
+    acc = _anti_find(cfg, args.name)
+    if not acc:
+        print(f"ERROR: akun '{args.name}' tidak ditemukan.")
+        sys.exit(1)
+    cfg["accounts"].remove(acc)
+    cfg.setdefault("index", 0)
+    if cfg["accounts"]:
+        cfg["index"] %= len(cfg["accounts"])
+    else:
+        cfg["index"] = 0
+    anti_save(cfg)
+    print(f"  Akun '{args.name}' dihapus dari rotasi.")
+    if args.delete_home and not anti_home(acc).startswith(os.path.expanduser("~")):
+        import shutil
+        shutil.rmtree(anti_home(acc), ignore_errors=True)
+        print(f"  Folder HOME dihapus: {anti_home(acc)}")
+
+
+def cmd_anti_login(args):
+    cfg = anti_load()
+    acc = _anti_find(cfg, args.name) if args.name else None
+    if args.name and not acc:
+        print(f"ERROR: akun '{args.name}' tidak ada.")
+        sys.exit(1)
+    home = anti_home(acc) if acc else os.path.expanduser("~")
+    os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
+    name = acc.get("name", "(HOME utama)") if acc else "(HOME utama)"
+    print("=" * 66)
+    print("  LANGKAH LOGIN ANTIGRAVITY (akun: " + name + ")")
+    print("  HOME: " + home)
+    print("=" * 66)
+    print("  1. URL login akan muncul di bawah (dimulai accounts.google.com).")
+    print("  2. Salin & buka URL itu di browser.")
+    print("  3. Login dengan akun Google yg mau dipakai ANTIGRAVITY.")
+    print("=" * 66)
+    env = dict(os.environ)
+    env["HOME"] = home
+    subprocess.run([agy_bin(), "-p", "ok"], env=env)
+
+
+def cmd_anti_chat(args):
+    cfg = anti_load()
+    if not cfg["accounts"]:
+        print("ERROR: belum ada akun antigravity. Tambah dulu: "
+              "gemini-manager antigravity add NAMA")
+        sys.exit(1)
+    acc = _anti_find(cfg, args.account) if args.account else anti_pick(cfg)
+    if not acc:
+        print("ERROR: akun tidak ditemukan.")
+        sys.exit(1)
+    env = dict(os.environ)
+    env["HOME"] = anti_home(acc)
+    print(f"  [{acc['name']}] {anti_home(acc)}")
+    subprocess.run([agy_bin(), "-p", args.prompt], env=env)
+
+
+def cmd_antigravity(args):
+    sub = args.anti_cmd
+    handler = {
+        "list": cmd_anti_list, "add": cmd_anti_add, "remove": cmd_anti_remove,
+        "login": cmd_anti_login, "chat": cmd_anti_chat,
+    }.get(sub)
+    if not handler:
+        print(__doc__)
+        print("Sub-perintah antigravity: list | add | remove | login | chat")
+        sys.exit(1)
+    handler(args)
+
+
+def cmd_anti_menu(args):
+    menu = [
+        ("Daftar akun", ("list",)),
+        ("Tambah akun baru", ("add",)),
+        ("Impor akun HOME yang sudah login", ("import-home",)),
+        ("Login akun", ("login",)),
+        ("Hapus akun", ("remove",)),
+        ("Chat round-robin", ("chat",)),
+        ("Kembali", None),
+    ]
+    cfg = anti_load()
+    print(f"\n  [Antigravity] {len(cfg['accounts'])} akun terdaftar")
+    for i, (label, _) in enumerate(menu, 1):
+        print(f"  {i}. {label}")
+    c = _input("  Pilih (1-6, kosong batal): ")
+    try:
+        idx = int(c) - 1
+    except (ValueError, IndexError):
+        return
+    if idx < 0 or idx >= len(menu):
+        return
+    label, key = menu[idx]
+    if key is None:
+        return
+    if key == ("list",):
+        cmd_anti_list(Namespace(verbose=False))
+    elif key == ("add",):
+        name = _input("  Nama akun (mis. agy-b): ")
+        if not name:
+            return
+        cmd_anti_add(Namespace(name=name, home=None))
+        cmd_anti_login(Namespace(name=name))
+    elif key == ("import-home",):
+        name = _input("  Nama akun (mis. utama): ")
+        home = _input("  Path HOME (kosong = /home/z): ") or os.path.expanduser("~")
+        if not name:
+            return
+        cmd_anti_add(Namespace(name=name, home=home))
+        if not os.path.exists(anti_token({"name": name, "home": home})):
+            cmd_anti_login(Namespace(name=name))
+        else:
+            print("  Token sudah ada, tidak perlu login ulang.")
+    elif key == ("login",):
+        name = _input("  Nama akun (kosong = HOME utama): ")
+        cmd_anti_login(Namespace(name=name or None))
+    elif key == ("remove",):
+        cmd_anti_list(Namespace(verbose=False))
+        name = _input("  Nama akun yang dihapus: ")
+        if not name:
+            return
+        cmd_anti_remove(Namespace(name=name, delete_home=False))
+    elif key == ("chat",):
+        prompt = _input("  Prompt (kosong batal): ")
+        if not prompt:
+            return
+        cmd_anti_chat(Namespace(prompt=prompt, account=None))
+
+
+def anti_bin_desc():
+    return os.path.basename(agy_bin())
+
+
+# ─── service unit ─────────────────────────────────────────────────────────────
 
 def service_unit_content():
     user = getpass.getuser()
@@ -496,6 +750,7 @@ def cmd_menu(args):
     menu_items = [
         ("Status service & akun", cmd_status),
         ("Lihat daftar akun", cmd_list),
+        ("Lihat API key", cmd_list_keys),
         ("Tambah akun (paste cookie)", _add_account_interactive),
         ("Hapus akun", _remove_account_interactive),
         ("Start service", cmd_start),
@@ -503,6 +758,7 @@ def cmd_menu(args):
         ("Restart service", cmd_restart),
         ("Monitor request real-time", cmd_monitor),
         ("Test rotasi akun", cmd_test),
+        ("Antigravity (round-robin akun)", cmd_anti_menu),
         ("Install/uninstall systemd service", cmd_service_menu),
         ("Keluar", None),
     ]
@@ -568,6 +824,9 @@ def main():
     p = sub.add_parser("list-accounts", help="daftar akun")
     p.set_defaults(fn=cmd_list)
 
+    p = sub.add_parser("list-keys", help="daftar API key")
+    p.set_defaults(fn=cmd_list_keys)
+
     p = sub.add_parser("add-account", help="tambah akun Google")
     p.add_argument("name", help="nama akun, mis. akun-2")
     p.add_argument("--cookie-file", help="path ke file cookie")
@@ -610,6 +869,34 @@ def main():
     p = sub.add_parser("monitor", help="monitor request real-time")
     p.add_argument("--interval", type=float, default=0.5, help="interval cek log (detik)")
     p.set_defaults(fn=cmd_monitor)
+
+    p = sub.add_parser("antigravity", help="kelola akun Antigravity round-robin")
+    anti = p.add_subparsers(dest="anti_cmd")
+
+    q = anti.add_parser("list", help="daftar akun antigravity")
+    q.set_defaults(anti_cmd="list")
+
+    q = anti.add_parser("add", help="tambah akun antigravity")
+    q.add_argument("name", help="nama akun, mis. agy-b")
+    q.add_argument("--home", default=None, help="pakai folder HOME yang sudah ada (mis. /home/z)")
+    q.set_defaults(anti_cmd="add")
+
+    q = anti.add_parser("remove", help="hapus akun antigravity")
+    q.add_argument("name", help="nama akun")
+    q.add_argument("--delete-home", action="store_true",
+                   help="hapus juga folder HOME terisolasi akun tsb")
+    q.set_defaults(anti_cmd="remove")
+
+    q = anti.add_parser("login", help="login OAuth ke akun (atau HOME utama jika kosong)")
+    q.add_argument("name", nargs="?", default=None, help="nama akun (opsional)")
+    q.set_defaults(anti_cmd="login")
+
+    q = anti.add_parser("chat", help="kirim prompt lewat akun round-robin")
+    q.add_argument("prompt", help="teks prompt")
+    q.add_argument("--account", default=None, help="paksa akun tertentu")
+    q.set_defaults(anti_cmd="chat")
+
+    p.set_defaults(fn=cmd_antigravity)
 
     args = parser.parse_args()
     global CONFIG_MODEL, PORT

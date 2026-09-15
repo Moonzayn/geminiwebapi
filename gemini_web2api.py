@@ -174,7 +174,7 @@ def _get_httpx_client():
             http2 = True
         except ImportError:
             http2 = False
-        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+        limits = httpx.Limits(max_connections=200, max_keepalive_connections=100)
         kwargs = {
             "timeout": CONFIG["request_timeout_sec"],
             "verify": True,
@@ -742,7 +742,7 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
-PROMPT_MAX_BYTES = 60000
+PROMPT_MAX_BYTES = 90000
 
 
 def decode_data_url(url: str):
